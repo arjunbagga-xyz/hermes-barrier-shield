@@ -1,0 +1,64 @@
+manifest_version: 2
+name: barrier-shield
+version: 0.1.0
+description: Control-Barrier Function (h(x) >= 0) and Lyapunov continuous safety shield
+  that solves a real-time Quadratic Program (QP) to smoothly dampen aggressive tool
+  actions instead of brick-wall blocking.
+author: Arjun Bagga <arjunbagga-xyz>
+license: MIT
+homepage: https://github.com/arjunbagga-xyz/hermes-barrier-shield
+repository: https://github.com/arjunbagga-xyz/hermes-barrier-shield
+min_hermes_version: 0.5.0
+max_hermes_version: 1.99.0
+categories:
+- control-theory
+- safety
+- middleware
+- autonomy
+tags:
+- control-barrier-functions
+- lyapunov-stability
+- quadratic-programming
+- forward-invariance
+- nagumo-theorem
+requires_env: []
+optional_env: []
+python_dependencies:
+- numpy>=1.26,<3.0
+- scipy>=1.11,<2.0
+- pydantic>=2.5,<3.0
+- fastapi>=0.109,<1.0
+provides_tools:
+- barrier_shield_project_action
+- barrier_shield_state_telemetry
+- barrier_shield_configure_controller
+provides_hooks:
+- pre_llm_call
+- post_llm_call
+provides_middleware:
+- tool_request
+- llm_request
+config_schema:
+  gamma_decay:
+    type: number
+    default: 0.45
+    description: Class-K barrier decay rate gamma in (0, 1] governing how smoothly
+      actions decelerate near the boundary h(x) = 0.
+  max_budget_usd:
+    type: number
+    default: 25.0
+    description: Cumulative spend barrier ceiling B_max in USD.
+  max_blast_radius_files:
+    type: number
+    default: 50.0
+    description: Maximum filesystem blast radius per autonomous window.
+web:
+  enabled: true
+  mount_path: /barrier-shield
+desktop:
+  enabled: true
+  entry: desktop/plugin.js
+  surfaces:
+  - transcript
+  - sidebar
+  - statusbar
