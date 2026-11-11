@@ -135,9 +135,35 @@ def handle_cbf_project_action(args: Dict[str, Any], **kwargs: Any) -> Dict[str, 
     if args.get("commit_state", True):
         CBF_STATE["x"] = np.asarray(qp["x_after"], dtype=float)
 
-    directive = "::barrier-shield " + json.dumps({"min_h": qp["min_h_after"], "damping": qp["damping_ratio"], "deflected": qp["deflected"], "lyapunov_v": qp["lyapunov_energy_v"], "u_nom": qp["u_nominal"], "u_safe": qp["u_safe_projected"]})
+    # Impact metrics — what the barrier contained vs the nominal request
+    impact = {
+        "files_averted": round(float(qp["u_nominal"][1] - qp["u_safe_projected"][1]), 2),
+        "spend_averted_usd": round(float(qp["u_nominal"][0] - qp["u_safe_projected"][0]), 2),
+        "workers_averted": round(float(qp["u_nominal"][2] - qp["u_safe_projected"][2]), 2),
+        "entropy_averted": round(float(qp["u_nominal"][3] - qp["u_safe_projected"][3]), 4),
+        "damping_percent": round(qp["damping_ratio"] * 100, 1),
+        "deflected": qp["deflected"],
+        "forward_invariant": qp["forward_invariant_verified"],
+    }
+
+    if qp["deflected"]:
+        summary = (
+            "🛡️ barrier-shield: contained — "
+            f"{impact['files_averted']} files averted, "
+            f"${impact['spend_averted_usd']} spend damped, "
+            f"{impact['workers_averted']} workers capped "
+            f"({impact['damping_percent']}% damping)"
+        )
+    else:
+        summary = (
+            f"🛡️ barrier-shield: safe — "
+            f"min_h={qp['min_h_after']}, no deflection needed"
+        )
+
+    qp["impact"] = impact
+    qp["summary"] = summary
+    qp["transcript_directive"] = summary  # plain text line, no visual
     qp["status"] = "CBF_DEFLECTED_SMOOTHLY" if qp["deflected"] else "NOMINAL_SAFE"
-    qp["transcript_directive"] = directive
     CBF_STATE["history"].append(qp)
     emit_plugin_event("barrier-shield", "cbf_projection", qp)
     return qp

@@ -55,10 +55,3 @@ config_schema:
 web:
   enabled: true
   mount_path: /barrier-shield
-desktop:
-  enabled: true
-  entry: desktop/plugin.js
-  surfaces:
-  - transcript
-  - sidebar
-  - statusbar

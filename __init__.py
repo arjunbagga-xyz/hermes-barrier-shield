@@ -7,6 +7,7 @@ try:
         CBF_CONTROLLER_SCHEMA,
         CBF_PROJECT_SCHEMA,
         CBF_TELEMETRY_SCHEMA,
+        _ensure_json_str,
         handle_cbf_configure_controller,
         handle_cbf_project_action,
         handle_cbf_state_telemetry,
@@ -22,6 +23,7 @@ except (ImportError, ValueError):
         CBF_CONTROLLER_SCHEMA,
         CBF_PROJECT_SCHEMA,
         CBF_TELEMETRY_SCHEMA,
+        _ensure_json_str,
         handle_cbf_configure_controller,
         handle_cbf_project_action,
         handle_cbf_state_telemetry,
@@ -34,12 +36,20 @@ except (ImportError, ValueError):
     )
 
 
+def _tool_handler(fn):
+    """Wrap a dict-returning engine handler so Hermes tool_call gets a JSON string."""
+    def wrapper(args=None, **kwargs):
+        result = fn(args if args is not None else {}, **kwargs)
+        return _ensure_json_str(result)
+    return wrapper
+
+
 def register(ctx) -> None:
     ctx.register_tool(
         name="barrier_shield_project_action",
         toolset="barrier_shield",
         schema=CBF_PROJECT_SCHEMA,
-        handler=handle_cbf_project_action,
+        handler=_tool_handler(handle_cbf_project_action),
         is_async=False,
         emoji="🛡️",
     )
@@ -47,7 +57,7 @@ def register(ctx) -> None:
         name="barrier_shield_state_telemetry",
         toolset="barrier_shield",
         schema=CBF_TELEMETRY_SCHEMA,
-        handler=handle_cbf_state_telemetry,
+        handler=_tool_handler(handle_cbf_state_telemetry),
         is_async=False,
         emoji="📈",
     )
@@ -55,7 +65,7 @@ def register(ctx) -> None:
         name="barrier_shield_configure_controller",
         toolset="barrier_shield",
         schema=CBF_CONTROLLER_SCHEMA,
-        handler=handle_cbf_configure_controller,
+        handler=_tool_handler(handle_cbf_configure_controller),
         is_async=False,
         emoji="🎛️",
     )
@@ -68,7 +78,7 @@ def register(ctx) -> None:
 
     ctx.register_command(
         name="cbf",
-        handler=lambda args="": handle_cbf_configure_controller({"mode": args.strip() or "ADAPTIVE_CLF_CBF"}),
+        handler=lambda args="": _ensure_json_str(handle_cbf_configure_controller({"mode": args.strip() or "ADAPTIVE_CLF_CBF"})),
         description="Control barrier-shield safety envelope mode (STRICT_BARRIER | ADAPTIVE_CLF_CBF | RND_SANDBOX_BOOST)",
     )
 
