@@ -52,6 +52,20 @@ config_schema:
     type: number
     default: 50.0
     description: Maximum filesystem blast radius per autonomous window.
+  enable_argument_rewriting:
+    type: boolean
+    default: false
+    description: Opt-in flag to automatically rewrite arguments near barrier limits. Default false.
+  rewritable_tools:
+    type: array
+    items:
+      type: string
+    default: []
+    description: Allowlist of tool names whose arguments may be rewritten when enabled.
+  enable_temperature_damping:
+    type: boolean
+    default: false
+    description: Opt-in flag to cool sampling temperature when Lyapunov instability rises. Default false.
 web:
   enabled: true
   mount_path: /barrier-shield

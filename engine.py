@@ -3,26 +3,48 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+import math
+import time
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from scipy.optimize import minimize
 
-try:
-    from hermes_cli.plugin_events import emit_plugin_event
-except ImportError:
-    def emit_plugin_event(plugin_name: str, event_type: str, payload: Dict[str, Any]) -> None:
-        pass
+
+def emit_plugin_event(plugin_name: str, event_type: str, payload: Dict[str, Any]) -> None:
+    """Safely broadcast plugin events (no-op fallback if event bus unavailable)."""
+    pass
 
 
-# 4D Agent State x_t = [spend_usd, blast_radius_files, concurrency_workers, entropy_Loops]
+# Per-session Control Barrier Function State with temporal decay
+# 4D Agent State x_t = [spend_usd, blast_radius_files, concurrency_workers, entropy_loops]
 # Barrier limits x_max = [max_spend, max_blast, max_workers, max_entropy]
-CBF_STATE: Dict[str, Any] = {
-    "x": np.array([4.0, 8.0, 2.0, 0.15], dtype=float),
-    "x_max": np.array([25.0, 50.0, 16.0, 1.0], dtype=float),
-    "gamma": 0.45,
-    "history": [],
-}
+SESSION_STATES: Dict[str, Dict[str, Any]] = {}
+
+
+def get_session_cbf_state(session_id: str = "default") -> Dict[str, Any]:
+    """Retrieve or initialize per-session barrier state with exponential decay toward baseline."""
+    sid = str(session_id or "default")
+    if sid not in SESSION_STATES:
+        SESSION_STATES[sid] = {
+            "x": np.array([0.0, 0.0, 1.0, 0.05], dtype=float),
+            "x_max": np.array([25.0, 50.0, 16.0, 1.0], dtype=float),
+            "gamma": 0.45,
+            "history": [],
+            "last_step_time": time.time(),
+        }
+    state = SESSION_STATES[sid]
+    now = time.time()
+    elapsed = max(0.0, now - state.get("last_step_time", now))
+    state["last_step_time"] = now
+    # Exponential decay toward resting baseline (half-life ~60 seconds) so session doesn't stay permanently throttled
+    decay_factor = math.exp(-elapsed / 60.0)
+    baseline = np.array([0.0, 0.0, 1.0, 0.05], dtype=float)
+    state["x"] = baseline + (state["x"] - baseline) * decay_factor
+    return state
+
+
+CBF_STATE: Dict[str, Any] = get_session_cbf_state("default")
 
 
 def compute_barrier_vector(x: np.ndarray, x_max: np.ndarray) -> np.ndarray:
@@ -113,16 +135,18 @@ def handle_cbf_project_action(args: Dict[str, Any], **kwargs: Any) -> Dict[str, 
     Project a proposed nominal control action u_nom = [delta_spend_usd, batch_files, workers, loop_entropy]
     onto the forward-invariant safe barrier manifold C = {x : h(x) >= 0} via CBF-QP.
     """
-    gamma = float(args.get("gamma", CBF_STATE["gamma"]))
+    session_id = str(args.get("session_id") or kwargs.get("session_id") or "default")
+    state = get_session_cbf_state(session_id)
+    gamma = float(args.get("gamma", state["gamma"]))
     if "state_x" in args and args["state_x"] is not None:
         x_curr = np.asarray(args["state_x"], dtype=float)
     else:
-        x_curr = CBF_STATE["x"].copy()
+        x_curr = state["x"].copy()
 
     if "limits_x_max" in args and args["limits_x_max"] is not None:
         x_max = np.asarray(args["limits_x_max"], dtype=float)
     else:
-        x_max = CBF_STATE["x_max"].copy()
+        x_max = state["x_max"].copy()
 
     u_nom = np.array([
         float(args.get("delta_spend_usd", 2.0)),
@@ -133,7 +157,7 @@ def handle_cbf_project_action(args: Dict[str, Any], **kwargs: Any) -> Dict[str, 
 
     qp = solve_cbf_qp(x_curr, u_nom, x_max, gamma=gamma)
     if args.get("commit_state", True):
-        CBF_STATE["x"] = np.asarray(qp["x_after"], dtype=float)
+        state["x"] = np.asarray(qp["x_after"], dtype=float)
 
     # Impact metrics — what the barrier contained vs the nominal request
     impact = {
@@ -164,26 +188,29 @@ def handle_cbf_project_action(args: Dict[str, Any], **kwargs: Any) -> Dict[str, 
     qp["summary"] = summary
     qp["transcript_directive"] = summary  # plain text line, no visual
     qp["status"] = "CBF_DEFLECTED_SMOOTHLY" if qp["deflected"] else "NOMINAL_SAFE"
-    CBF_STATE["history"].append(qp)
+    state["history"].append(qp)
     emit_plugin_event("barrier-shield", "cbf_projection", qp)
     return qp
 
 
 def handle_cbf_state_telemetry(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     """Inspect or reset the current 4D Control Barrier Function state x_t and barrier margins h(x_t)."""
+    session_id = str(args.get("session_id") or kwargs.get("session_id") or "default")
+    state = get_session_cbf_state(session_id)
     if args.get("reset"):
-        CBF_STATE["x"] = np.array([0.0, 0.0, 1.0, 0.05], dtype=float)
-        CBF_STATE["history"].clear()
+        state["x"] = np.array([0.0, 0.0, 1.0, 0.05], dtype=float)
+        state["history"].clear()
 
-    h_vec = compute_barrier_vector(CBF_STATE["x"], CBF_STATE["x_max"])
+    h_vec = compute_barrier_vector(state["x"], state["x_max"])
     return {
         "status": "ok",
+        "session_id": session_id,
         "state_labels": ["spend_usd", "blast_radius_files", "concurrency_workers", "loop_entropy"],
-        "state_x": [round(float(v), 4) for v in CBF_STATE["x"]],
-        "limits_x_max": [round(float(v), 4) for v in CBF_STATE["x_max"]],
+        "state_x": [round(float(v), 4) for v in state["x"]],
+        "limits_x_max": [round(float(v), 4) for v in state["x_max"]],
         "barrier_h": [round(float(v), 4) for v in h_vec],
         "min_barrier_h": round(float(np.min(h_vec)), 4),
-        "lyapunov_energy_v": round(compute_lyapunov_energy(CBF_STATE["x"], CBF_STATE["x_max"]), 4),
+        "lyapunov_energy_v": round(compute_lyapunov_energy(state["x"], state["x_max"]), 4),
     }
 
 
@@ -233,43 +260,46 @@ def handle_cbf_configure_controller(args: Dict[str, Any], **kwargs: Any) -> Dict
     limits x_max = [spend_usd, blast_files, workers, loop_entropy], or trigger an emergency
     Lyapunov cooldown.
     """
+    session_id = str(args.get("session_id") or kwargs.get("session_id") or "default")
+    state = get_session_cbf_state(session_id)
     mode = str(args.get("mode", "")).upper()
     if mode in CONTROLLER_MODES:
-        CBF_STATE["gamma"] = CONTROLLER_MODES[mode]["gamma"]
-        CBF_STATE["mode"] = mode
+        state["gamma"] = CONTROLLER_MODES[mode]["gamma"]
+        state["mode"] = mode
 
     if "gamma" in args and args["gamma"] is not None:
-        CBF_STATE["gamma"] = float(np.clip(float(args["gamma"]), 0.05, 1.0))
+        state["gamma"] = float(np.clip(float(args["gamma"]), 0.05, 1.0))
 
     if "limits_x_max" in args and isinstance(args["limits_x_max"], list) and len(args["limits_x_max"]) == 4:
-        CBF_STATE["x_max"] = np.asarray(args["limits_x_max"], dtype=float)
+        state["x_max"] = np.asarray(args["limits_x_max"], dtype=float)
 
     if args.get("lyapunov_lambda1") is not None:
         # Automatic cross-plugin feedback control: if velvet-takens reports positive Lyapunov exponent
         # (chaotic instability), automatically tighten gamma!
         lam1 = float(args["lyapunov_lambda1"])
         if lam1 > 0.02:
-            CBF_STATE["gamma"] = round(max(0.15, 0.45 / (1.0 + 4.0 * lam1)), 3)
-            CBF_STATE["mode"] = "CHAOS_COUPLED_TIGHTENED"
+            state["gamma"] = round(max(0.15, 0.45 / (1.0 + 4.0 * lam1)), 3)
+            state["mode"] = "CHAOS_COUPLED_TIGHTENED"
 
     if args.get("emergency_dampen"):
-        CBF_STATE["gamma"] = 0.15
-        CBF_STATE["mode"] = "EMERGENCY_DAMPENED"
+        state["gamma"] = 0.15
+        state["mode"] = "EMERGENCY_DAMPENED"
 
-    h_vec = compute_barrier_vector(CBF_STATE["x"], CBF_STATE["x_max"])
+    h_vec = compute_barrier_vector(state["x"], state["x_max"])
     labels = ["spend_usd", "blast_radius_files", "concurrency_workers", "loop_entropy"]
     bottleneck_idx = int(np.argmin(h_vec))
 
     return {
         "status": "CONTROLLER_UPDATED",
-        "active_mode": CBF_STATE.get("mode", "ADAPTIVE_CLF_CBF"),
-        "gamma": CBF_STATE["gamma"],
-        "state_x": [round(float(v), 4) for v in CBF_STATE["x"]],
-        "limits_x_max": [round(float(v), 4) for v in CBF_STATE["x_max"]],
+        "session_id": session_id,
+        "active_mode": state.get("mode", "ADAPTIVE_CLF_CBF"),
+        "gamma": state["gamma"],
+        "state_x": [round(float(v), 4) for v in state["x"]],
+        "limits_x_max": [round(float(v), 4) for v in state["x_max"]],
         "barrier_h": [round(float(v), 4) for v in h_vec],
         "active_bottleneck_channel": labels[bottleneck_idx],
         "active_bottleneck_margin_h": round(float(h_vec[bottleneck_idx]), 4),
-        "lyapunov_energy_v": round(compute_lyapunov_energy(CBF_STATE["x"], CBF_STATE["x_max"]), 4),
+        "lyapunov_energy_v": round(compute_lyapunov_energy(state["x"], state["x_max"]), 4),
     }
 
 

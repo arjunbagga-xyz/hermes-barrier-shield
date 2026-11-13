@@ -13,15 +13,6 @@ When executing batch file mutations, concurrent subagents, shell pipelines, or b
 - **Directive attrs are the only data channel to the card.** The desktop plugin receives only parsed attrs. Pass every value the card/pane/chip needs (mode, gamma, limits, min_h before/after) through the directive string — there is no shared backend state channel to the frontend.
 - **Desktop visual surfaces default to static.** A pane or chip registered with a static `render: () => jsx(...)` never updates. Share state across components with a module-level store updated by the directive's render callback, plus a `CustomEvent` + `useEffect` listener so pane/chip re-render when a new directive lands.
 
-## Invocation gotcha — deferred tool contract
-The `barrier_shield_*` tools are registered as deferred (plugin) tools. Calling them via `tool_call` can fail with `unsupported result type: dict` because the handlers return raw dicts. When that happens, do NOT retry unchanged. Instead import the handlers directly:
-```
-import sys; sys.path.insert(0, r"C:\Users\MSI\AppData\Local\hermes\plugins\barrier-shield")
-from engine import handle_cbf_project_action, handle_cbf_state_telemetry, handle_cbf_configure_controller
-result = handle_cbf_project_action({"delta_spend_usd": ..., "batch_files": ..., "workers": ..., "loop_entropy": ...})
-```
-The returned dict is identical to what the tool would have returned. Alternatively wrap a handler with `_ensure_json_str` at registration so Hermes receives a JSON string (the installed fix does this).
-
 ## Controller modes
 - `STRICT_BARRIER`: gamma 0.25 — high-damping conservative envelope for production.
 - `ADAPTIVE_CLF_CBF`: gamma 0.45 — balanced (default).
@@ -29,5 +20,9 @@ The returned dict is identical to what the tool would have returned. Alternative
 - `emergency_dampen`: drops gamma to 0.15.
 - Lyapunov coupling: pass `lyapunov_lambda1` > 0.02 to auto-tighten gamma (chaos-takens feedback).
 
+## Safety configuration
+- Argument rewriting (`enable_argument_rewriting`) and temperature damping (`enable_temperature_damping`) are opt-in and disabled by default.
+- Payment amounts are never scaled or modified, and terminal commands are never modified.
+
 ## State semantics
-State x = [spend_usd, blast_radius_files, concurrency_workers, loop_entropy]; limits x_max default [25, 50, 16, 1.0]. `commit_state` (default true) advances x. Use `commit_state=False` for dry-run projections. Reset via `barrier_shield_state_telemetry({"reset": true})."
+State x = [spend_usd, blast_radius_files, concurrency_workers, loop_entropy]; limits x_max default [25, 50, 16, 1.0]. State decays exponentially toward resting baseline per session. `commit_state` (default true) advances x. Use `commit_state=False` for dry-run projections. Reset via `barrier_shield_state_telemetry({"reset": true}).`
