@@ -12,9 +12,12 @@ By **Nagumo's Theorem**, $\mathcal{C}$ is mathematically **forward-invariant**: 
 
 ## Configuration
 
-All active argument rewriting and temperature damping behaviors are opt-in and disabled by default:
+All active argument rewriting and temperature damping behaviors are opt-in and disabled by default, configured via Hermes plugin configuration (`ctx.get_config` captured during registration):
 
 - `enable_argument_rewriting` (boolean, default: `false`): When enabled, projects resource parameters (`batch_files`, `workers`, `concurrency`, `limit`) onto safe forward-invariant bounds for tools explicitly listed in `rewritable_tools`. Terminal commands and financial payment amounts are never modified.
 - `rewritable_tools` (list of strings, default: `[]`): Explicit allowlist of tool names whose resource parameters may be adjusted when `enable_argument_rewriting` is true.
 - `enable_temperature_damping` (boolean, default: `false`): When enabled, applies Lyapunov energy damping to cool sampling temperature when loop instability rises.
-- State is scoped per `session_id` and decays exponentially toward baseline over time to prevent permanent throttling across long-running sessions.
+- `max_budget_usd` (number, default: `25.0`): Owner ceiling for cumulative spend in USD. Autonomous tool calls cannot raise limits beyond owner-configured ceilings.
+- `max_blast_radius_files` (number, default: `50.0`): Owner ceiling for filesystem blast radius.
+- `gamma_decay` (number, default: `0.45`): Class-K barrier decay rate $\gamma \in (0, 1]$.
+- State is scoped per `session_id`, decays exponentially toward baseline over time, and inactive/expired session states are automatically pruned to prevent unbounded memory growth on long-lived gateways.

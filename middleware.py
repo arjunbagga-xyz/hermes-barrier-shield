@@ -3,12 +3,44 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 try:
     from .engine import get_session_cbf_state, handle_cbf_project_action
 except (ImportError, ValueError):
     from engine import get_session_cbf_state, handle_cbf_project_action
+
+_PLUGIN_CTX: Any = None
+
+
+def set_plugin_context(ctx: Any) -> None:
+    """Store the HermesPluginContext captured during registration."""
+    global _PLUGIN_CTX
+    _PLUGIN_CTX = ctx
+
+
+def get_plugin_config(key: str, default: Any = None) -> Any:
+    """Retrieve configuration option from the registered HermesPluginContext."""
+    ctx = _PLUGIN_CTX
+    if ctx is not None:
+        if hasattr(ctx, "get_config"):
+            try:
+                val = ctx.get_config(key, default)
+                if val is not None:
+                    return val
+            except TypeError:
+                try:
+                    cfg = ctx.get_config()
+                    if isinstance(cfg, dict) and key in cfg:
+                        return cfg[key]
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if hasattr(ctx, "config") and isinstance(ctx.config, dict):
+            if key in ctx.config:
+                return ctx.config[key]
+    return default
 
 
 def pre_llm_call_hook(
@@ -25,13 +57,16 @@ def post_llm_call_hook(
     session_id: Union[str, Dict[str, Any]] = "",
     **kwargs: Any,
 ) -> Optional[Dict[str, Any]]:
-    sid = session_id if isinstance(session_id, str) else str(session_id.get("session_id", "default") if isinstance(session_id, dict) else "default")
+    payload = session_id if isinstance(session_id, dict) else kwargs.get("payload")
+    sid = session_id if isinstance(session_id, str) else str(
+        session_id.get("session_id", "default") if isinstance(session_id, dict) else kwargs.get("session_id", "default")
+    )
     state = get_session_cbf_state(sid)
-    if isinstance(session_id, dict) and state.get("history"):
+    if isinstance(payload, dict) and state.get("history"):
         latest = state["history"][-1]
         if latest.get("deflected"):
-            session_id.setdefault("directives", []).append(latest.get("transcript_directive", ""))
-        return session_id
+            payload.setdefault("directives", []).append(latest.get("transcript_directive", ""))
+        return payload
     return None
 
 
@@ -66,79 +101,77 @@ def _project_tool_args(args: Dict[str, Any], session_id: str = "default") -> tup
 
 
 def cbf_tool_request_middleware(
-    first_arg: Union[str, Dict[str, Any]],
-    second_arg: Union[Dict[str, Any], Callable[[Dict[str, Any]], Any]],
-    original_args: Optional[Dict[str, Any]] = None,
+    tool_name: str = "",
+    args: Optional[Dict[str, Any]] = None,
+    session_id: str = "",
     **kwargs: Any,
-) -> Any:
+) -> Optional[Dict[str, Any]]:
     """
-    Supports both:
-      1. Upstream Hermes `tool_request` contract: `(tool_name: str, args: dict, original_args: dict = None, **kwargs)`
-      2. Chain-style `(tool_request_dict, next_fn)`.
+    Continuous Control-Barrier Function (CBF-QP) tool request middleware.
+
+    Conforms to Hermes keyword-args middleware contract:
+    called as `tool_request(tool_name=..., args=..., original_args=..., session_id=..., ...)`.
+    Returns `{"args": new_args}` when projected/rewritten, or `None` if safe/unmodified.
     """
-    session_id = str(kwargs.get("session_id", "default"))
-    enable_rewriting = bool(kwargs.get("enable_argument_rewriting", False))
-    rewritable_tools = set(kwargs.get("rewritable_tools", []))
+    if args is None:
+        args = kwargs.get("args") or kwargs.get("arguments")
+    if not isinstance(args, dict):
+        return None
 
-    if isinstance(first_arg, str) and isinstance(second_arg, dict):
-        tool_name = first_arg
-        # Never edit terminal commands
-        if tool_name in ("terminal", "execute_bash", "bash", "sh"):
-            return None
+    actual_tool_name = str(tool_name or kwargs.get("tool_name", ""))
+    sid = str(session_id or kwargs.get("session_id") or "default")
 
-        # Only rewrite if explicitly enabled and tool is in configured allowlist
-        if not enable_rewriting or tool_name not in rewritable_tools:
-            return None
+    # Read opt-in config from HermesPluginContext captured during register()
+    enable_rewriting = bool(
+        kwargs.get("enable_argument_rewriting")
+        if "enable_argument_rewriting" in kwargs
+        else get_plugin_config("enable_argument_rewriting", False)
+    )
+    raw_rewritable = (
+        kwargs.get("rewritable_tools")
+        if "rewritable_tools" in kwargs
+        else get_plugin_config("rewritable_tools", [])
+    )
+    rewritable_tools = set(raw_rewritable) if isinstance(raw_rewritable, (list, tuple, set)) else set()
 
-        new_args, qp = _project_tool_args(second_arg, session_id=session_id)
-        if not qp.get("deflected"):
-            return None
+    # Never edit terminal commands
+    if actual_tool_name in ("terminal", "execute_bash", "bash", "sh"):
+        return None
 
-        return {
-            "args": new_args,
-            "source": "barrier-shield",
-            "reason": f"CBF-QP projected arguments along h(x)>={qp.get('min_h_after', 0.0):.2f} (damped {qp.get('damping_ratio', 0.0):.0%})",
-            "cbf_projection": qp,
-        }
+    # Only rewrite if explicitly enabled and tool is in configured allowlist
+    if not enable_rewriting or actual_tool_name not in rewritable_tools:
+        return None
 
-    if isinstance(first_arg, dict) and callable(second_arg):
-        args = first_arg.get("arguments")
-        tool_name = first_arg.get("name", "")
-        if (
-            enable_rewriting
-            and tool_name in rewritable_tools
-            and tool_name not in ("terminal", "execute_bash", "bash", "sh")
-            and isinstance(args, dict)
-        ):
-            new_args, qp = _project_tool_args(args, session_id=session_id)
-            first_arg["arguments"] = new_args
-            first_arg["cbf_projection"] = qp
-        return second_arg(first_arg)
+    new_args, qp = _project_tool_args(args, session_id=sid)
+    if not qp.get("deflected"):
+        return None
 
-    return None
+    return {"args": new_args}
 
 
 def cbf_llm_request_middleware(
-    request: Dict[str, Any],
-    second_arg: Optional[Union[Dict[str, Any], Callable[[Dict[str, Any]], Any]]] = None,
+    request: Optional[Dict[str, Any]] = None,
+    session_id: str = "",
     **kwargs: Any,
-) -> Any:
+) -> Optional[Dict[str, Any]]:
     """Control Lyapunov Function (CLF) temperature damping when loop energy V(x) rises (opt-in)."""
-    enable_damping = bool(kwargs.get("enable_temperature_damping", False))
-    session_id = str(kwargs.get("session_id", "default"))
-    state = get_session_cbf_state(session_id)
-
-    if not enable_damping:
-        if callable(second_arg):
-            return second_arg(request)
+    if request is None:
+        request = kwargs.get("request")
+    if not isinstance(request, dict):
         return None
 
-    history = state.get("history", [])
-    if callable(second_arg):
-        if history and history[-1].get("lyapunov_energy_v", 0.0) > 0.35 and "temperature" in request:
-            request["temperature"] = round(float(request["temperature"]) * 0.65, 3)
-        return second_arg(request)
+    enable_damping = bool(
+        kwargs.get("enable_temperature_damping")
+        if "enable_temperature_damping" in kwargs
+        else get_plugin_config("enable_temperature_damping", False)
+    )
+    if not enable_damping:
+        return None
 
+    sid = str(session_id or kwargs.get("session_id") or "default")
+    state = get_session_cbf_state(sid)
+
+    history = state.get("history", [])
     if history and history[-1].get("lyapunov_energy_v", 0.0) > 0.35 and "temperature" in request:
         new_req = dict(request)
         new_req["temperature"] = round(float(new_req["temperature"]) * 0.65, 3)

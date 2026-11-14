@@ -16,19 +16,85 @@ def emit_plugin_event(plugin_name: str, event_type: str, payload: Dict[str, Any]
     pass
 
 
-# Per-session Control Barrier Function State with temporal decay
+_PLUGIN_CTX: Any = None
+
+
+def set_plugin_context(ctx: Any) -> None:
+    """Store the HermesPluginContext captured during registration."""
+    global _PLUGIN_CTX
+    _PLUGIN_CTX = ctx
+
+
+DEFAULT_OWNER_X_MAX = np.array([25.0, 50.0, 16.0, 1.0], dtype=float)
+
+
+def get_owner_limits_ceiling() -> np.ndarray:
+    """Retrieve owner-configured ceiling limits [max_spend, max_blast, max_workers, max_entropy]."""
+    ctx = _PLUGIN_CTX
+    spend = 25.0
+    files = 50.0
+    if ctx is not None:
+        if hasattr(ctx, "get_config"):
+            try:
+                spend = float(ctx.get_config("max_budget_usd", 25.0))
+                files = float(ctx.get_config("max_blast_radius_files", 50.0))
+            except Exception:
+                pass
+        elif hasattr(ctx, "config") and isinstance(ctx.config, dict):
+            spend = float(ctx.config.get("max_budget_usd", 25.0))
+            files = float(ctx.config.get("max_blast_radius_files", 50.0))
+    return np.array([spend, files, 16.0, 1.0], dtype=float)
+
+
+# Per-session Control Barrier Function State with temporal decay and pruning
 # 4D Agent State x_t = [spend_usd, blast_radius_files, concurrency_workers, entropy_loops]
 # Barrier limits x_max = [max_spend, max_blast, max_workers, max_entropy]
 SESSION_STATES: Dict[str, Dict[str, Any]] = {}
+MAX_SESSION_STATES: int = 256
+SESSION_TTL_SECONDS: float = 7200.0  # 2 hours
+MAX_HISTORY_PER_SESSION: int = 50
+
+
+def prune_session_states(
+    max_sessions: int = MAX_SESSION_STATES,
+    ttl_seconds: float = SESSION_TTL_SECONDS,
+) -> None:
+    """Evict expired or excess session states so a long-lived gateway doesn't grow memory indefinitely."""
+    now = time.time()
+    # 1. Prune expired sessions (keep "default")
+    expired = [
+        sid
+        for sid, s in SESSION_STATES.items()
+        if sid != "default" and (now - s.get("last_step_time", now)) > ttl_seconds
+    ]
+    for sid in expired:
+        SESSION_STATES.pop(sid, None)
+
+    # 2. If count still exceeds max_sessions, evict LRU (least recently used)
+    if len(SESSION_STATES) > max_sessions:
+        sorted_sessions = sorted(
+            [
+                (sid, s.get("last_step_time", 0.0))
+                for sid, s in SESSION_STATES.items()
+                if sid != "default"
+            ],
+            key=lambda item: item[1],
+        )
+        excess = len(SESSION_STATES) - max_sessions
+        for sid, _ in sorted_sessions[:excess]:
+            SESSION_STATES.pop(sid, None)
 
 
 def get_session_cbf_state(session_id: str = "default") -> Dict[str, Any]:
     """Retrieve or initialize per-session barrier state with exponential decay toward baseline."""
     sid = str(session_id or "default")
     if sid not in SESSION_STATES:
+        prune_session_states()
+        owner_ceiling = get_owner_limits_ceiling()
         SESSION_STATES[sid] = {
             "x": np.array([0.0, 0.0, 1.0, 0.05], dtype=float),
-            "x_max": np.array([25.0, 50.0, 16.0, 1.0], dtype=float),
+            "x_max": owner_ceiling.copy(),
+            "owner_x_max": owner_ceiling.copy(),
             "gamma": 0.45,
             "history": [],
             "last_step_time": time.time(),
@@ -143,8 +209,11 @@ def handle_cbf_project_action(args: Dict[str, Any], **kwargs: Any) -> Dict[str, 
     else:
         x_curr = state["x"].copy()
 
+    owner_ceiling = state.get("owner_x_max", get_owner_limits_ceiling())
     if "limits_x_max" in args and args["limits_x_max"] is not None:
-        x_max = np.asarray(args["limits_x_max"], dtype=float)
+        proposed = np.asarray(args["limits_x_max"], dtype=float)
+        # Ensure model cannot arbitrarily raise limits beyond owner ceiling in project action
+        x_max = np.minimum(proposed, owner_ceiling)
     else:
         x_max = state["x_max"].copy()
 
@@ -189,6 +258,8 @@ def handle_cbf_project_action(args: Dict[str, Any], **kwargs: Any) -> Dict[str, 
     qp["transcript_directive"] = summary  # plain text line, no visual
     qp["status"] = "CBF_DEFLECTED_SMOOTHLY" if qp["deflected"] else "NOMINAL_SAFE"
     state["history"].append(qp)
+    if len(state["history"]) > MAX_HISTORY_PER_SESSION:
+        state["history"] = state["history"][-MAX_HISTORY_PER_SESSION:]
     emit_plugin_event("barrier-shield", "cbf_projection", qp)
     return qp
 
@@ -208,6 +279,7 @@ def handle_cbf_state_telemetry(args: Dict[str, Any], **kwargs: Any) -> Dict[str,
         "state_labels": ["spend_usd", "blast_radius_files", "concurrency_workers", "loop_entropy"],
         "state_x": [round(float(v), 4) for v in state["x"]],
         "limits_x_max": [round(float(v), 4) for v in state["x_max"]],
+        "owner_limits_x_max": [round(float(v), 4) for v in state.get("owner_x_max", get_owner_limits_ceiling())],
         "barrier_h": [round(float(v), 4) for v in h_vec],
         "min_barrier_h": round(float(np.min(h_vec)), 4),
         "lyapunov_energy_v": round(compute_lyapunov_energy(state["x"], state["x_max"]), 4),
@@ -259,6 +331,7 @@ def handle_cbf_configure_controller(args: Dict[str, Any], **kwargs: Any) -> Dict
     to switch control modes, tune barrier decay rate gamma in (0.05, 1.0], update ceiling
     limits x_max = [spend_usd, blast_files, workers, loop_entropy], or trigger an emergency
     Lyapunov cooldown.
+    Limits cannot be raised beyond owner-configured ceilings by model calls.
     """
     session_id = str(args.get("session_id") or kwargs.get("session_id") or "default")
     state = get_session_cbf_state(session_id)
@@ -270,8 +343,31 @@ def handle_cbf_configure_controller(args: Dict[str, Any], **kwargs: Any) -> Dict
     if "gamma" in args and args["gamma"] is not None:
         state["gamma"] = float(np.clip(float(args["gamma"]), 0.05, 1.0))
 
+    limits_note = None
     if "limits_x_max" in args and isinstance(args["limits_x_max"], list) and len(args["limits_x_max"]) == 4:
-        state["x_max"] = np.asarray(args["limits_x_max"], dtype=float)
+        proposed = np.asarray(args["limits_x_max"], dtype=float)
+        owner_ceiling = state.get("owner_x_max")
+        if owner_ceiling is None:
+            owner_ceiling = get_owner_limits_ceiling()
+            state["owner_x_max"] = owner_ceiling.copy()
+
+        # Check if caller is privileged owner (e.g. from internal API or CLI command)
+        is_owner = bool(kwargs.get("is_owner", False))
+        if is_owner:
+            state["owner_x_max"] = np.maximum(proposed, 1e-3)
+            state["x_max"] = state["owner_x_max"].copy()
+        else:
+            # Model cannot arbitrarily raise limits beyond owner-set ceiling.
+            # It may only tighten (lower) limits or keep them within owner bounds.
+            clamped = np.minimum(proposed, owner_ceiling)
+            # Ensure strictly positive minimum limits
+            clamped = np.maximum(clamped, np.array([0.1, 1.0, 1.0, 0.01], dtype=float))
+            if not np.allclose(proposed, clamped, atol=1e-4):
+                limits_note = (
+                    f"Proposed limits exceeded owner ceiling {list(np.round(owner_ceiling, 2))}; "
+                    f"clamped to {list(np.round(clamped, 2))}."
+                )
+            state["x_max"] = clamped
 
     if args.get("lyapunov_lambda1") is not None:
         # Automatic cross-plugin feedback control: if velvet-takens reports positive Lyapunov exponent
@@ -289,18 +385,22 @@ def handle_cbf_configure_controller(args: Dict[str, Any], **kwargs: Any) -> Dict
     labels = ["spend_usd", "blast_radius_files", "concurrency_workers", "loop_entropy"]
     bottleneck_idx = int(np.argmin(h_vec))
 
-    return {
+    res = {
         "status": "CONTROLLER_UPDATED",
         "session_id": session_id,
         "active_mode": state.get("mode", "ADAPTIVE_CLF_CBF"),
         "gamma": state["gamma"],
         "state_x": [round(float(v), 4) for v in state["x"]],
         "limits_x_max": [round(float(v), 4) for v in state["x_max"]],
+        "owner_limits_x_max": [round(float(v), 4) for v in state.get("owner_x_max", get_owner_limits_ceiling())],
         "barrier_h": [round(float(v), 4) for v in h_vec],
         "active_bottleneck_channel": labels[bottleneck_idx],
         "active_bottleneck_margin_h": round(float(h_vec[bottleneck_idx]), 4),
         "lyapunov_energy_v": round(compute_lyapunov_energy(state["x"], state["x_max"]), 4),
     }
+    if limits_note:
+        res["limits_note"] = limits_note
+    return res
 
 
 CBF_CONTROLLER_SCHEMA: Dict[str, Any] = {
@@ -308,14 +408,14 @@ CBF_CONTROLLER_SCHEMA: Dict[str, Any] = {
     "description": (
         "Interactive closed-loop control mechanism for the Control-Barrier safety shield: "
         "switch modes (STRICT_BARRIER, ADAPTIVE_CLF_CBF, RND_SANDBOX_BOOST), tune gamma, "
-        "adjust resource ceilings x_max, or couple gamma directly to velvet-takens Lyapunov exponent."
+        "adjust resource ceilings x_max (tightening only, bounded by owner ceiling), or couple gamma directly to velvet-takens Lyapunov exponent."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "mode": {"type": "string", "description": "Control mode: STRICT_BARRIER, ADAPTIVE_CLF_CBF, or RND_SANDBOX_BOOST."},
             "gamma": {"type": "number", "description": "Class-K barrier decay rate gamma in [0.05, 1.0]."},
-            "limits_x_max": {"type": "array", "items": {"type": "number"}, "description": "[max_spend, max_files, max_workers, max_entropy]."},
+            "limits_x_max": {"type": "array", "items": {"type": "number"}, "description": "[max_spend, max_files, max_workers, max_entropy] - cannot exceed owner-configured ceilings."},
             "lyapunov_lambda1": {"type": "number", "description": "Optional Largest Lyapunov Exponent from velvet-takens for chaos-coupled damping."},
             "emergency_dampen": {"type": "boolean", "description": "Immediately drop gamma to 0.15 emergency damping."},
         },
